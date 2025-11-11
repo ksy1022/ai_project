@@ -5,6 +5,7 @@ import json
 import pathlib
 import requests
 import urllib.parse
+# from mr_extract import extract_mr   # ❌ spleeter 관련 제거
 from typing import Dict, Any, List, Union, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -14,6 +15,8 @@ from search_lyrics import LyricsSearcher
 from agents import debate_and_merge
 from compose_prompt import build_suno_prompt
 
+
+# os.environ.setdefault("SPLEETER_MODEL_PATH", r"C:\ai\models\spleeter")  # ❌ spleeter 관련 제거
 
 def _pull_webhook_site_latest(token: str) -> dict | None:
     """
@@ -326,6 +329,9 @@ def main(image_path):
     suno_base = _get_env("SUNO_BASE_URL", default="https://api.sunoapi.org/api/v1")
     webhook_token = os.getenv("WEBHOOK_SITE_TOKEN")  # 토큰만 (URL 말고 token)
 
+    make_inst_only = os.getenv("MAKE_INSTRUMENTAL") == "1"  # MR만
+    make_both      = os.getenv("MAKE_BOTH") == "1"          # 보컬+MR 둘 다
+
     # 1) 이미지 → 쿼리
     query = image_to_query(image_path, api_key)
     print("쿼리:", query)
@@ -350,6 +356,9 @@ def main(image_path):
     callback_url = _get_env("SUNO_CALLBACK_URL", default="https://httpbin.org/post")
     suno_payload.setdefault("callBackUrl", callback_url)
     suno_payload.setdefault("callbackUrl", callback_url)
+
+    base_payload = dict(suno_payload)
+
     if isinstance(suno_payload, str):
         # 혹시 문자열만 올 경우 대비(가사만 온 경우)
         suno_payload = {
@@ -360,7 +369,50 @@ def main(image_path):
             "title": "MAS Demo Track",
             "prompt": suno_payload
         }
+    
+     # 생성할 목록 구성
+    payloads: List[Tuple[Dict[str, Any], str]] = []
+    if make_both:
+        p1 = dict(base_payload); p1["instrumental"] = False  # 보컬 포함
+        p2 = dict(base_payload); p2["instrumental"] = True   # MR만
+        payloads.append((p1, ""))         # 파일명 접미사 없음 (보컬)
+        payloads.append((p2, "_inst"))    # _inst 붙여서 저장 (MR)
+    else:
+        p = dict(base_payload)
+        p["instrumental"] = bool(make_inst_only)  # True면 MR, False면 보컬
+        payloads.append((p, "_inst" if make_inst_only else ""))
 
+    outdir = _ensure_outputs_dir()
+
+    for idx, (payload, suffix) in enumerate(payloads, start=1):
+        mode = "Instrumental" if payload.get("instrumental") else "Vocal"
+        print(f"\n🎵 Suno 음악 생성 중... ({mode})")
+        result = suno_generate_and_wait(payload, api_key=suno_key, base_url=suno_base)
+        tracks: List[Dict[str, Any]] = (result.get("tracks", []) or [])[:1]
+
+        print(f"\n생성 완료! (task_id={result['task_id']})  저장 경로: {outdir}")
+        for i, t in enumerate(tracks, 1):
+            title = t.get("title") or f"track_{i}"
+            duration = t.get("duration")
+            audio_url = (
+                t.get("sourceAudioUrl")
+                or t.get("audioUrl")
+                or t.get("streamAudioUrl")
+                or t.get("audio_url")
+            )
+            dur_txt = f"{duration}s" if duration is not None else "unknown"
+            print(f"[트랙 {i}] {title} — {duration}s")
+            print("URL:", audio_url)
+            if not audio_url:
+                print("⚠ 오디오 URL이 비었습니다. 다음 트랙으로 넘어갑니다.")
+                continue
+
+            safe = "".join(ch if ch.isalnum() or ch in " ._-" else "_" for ch in title)
+            filename = f"{i:02d}_{safe}{suffix}.mp3"
+            pth = download_audio(audio_url, outdir, filename=filename)
+            print("저장:", pth)
+    return
+    
     print("\n[Suno 요청 페이로드]\n", json.dumps(suno_payload, ensure_ascii=False, indent=2))
 
     dry_run = os.getenv("DRY_RUN", "0") == "1"
@@ -372,7 +424,8 @@ def main(image_path):
     # 5) Suno 생성
     print("\n🎵 Suno 음악 생성 중...")
     result = suno_generate_and_wait(suno_payload, api_key=suno_key, base_url=suno_base)
-    tracks: List[Dict[str, Any]] = result.get("tracks", [])
+    tracks: List[Dict[str, Any]] = (result.get("tracks", []) or [])[:1]
+
 
     # 6) 결과 출력 + 저장
     outdir = _ensure_outputs_dir()
